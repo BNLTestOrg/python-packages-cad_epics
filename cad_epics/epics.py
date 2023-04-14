@@ -1,46 +1,53 @@
 """Basic EPICS access API using caproto threading.
-The API is similar to cad_io."""
-__version__ = 'v0.0.1 2023-03-12'# adopted from cad_io.epicsAccess_caproto 3.5.1 2021-01-11
-#print(f'{__file__}, {__version__}')
+The API is similar to cad_io.
+The devPar argument is tuple (deviceName,parameterName).
+The EPICS PV name is concatenation of the deviceName and parameterName
+
+For example: epics.get(('testAPD:scope1:','MaxValue_RBV')) returns 
+{('testAPD:scope1:', 'MaxValue_RBV'): {'value': 1.5620877339306638, 'timestamp': 1681488886.923712, 'alarm': 0}}
+"""
+__version__ = 'v0.0.2 2023-04-14'# The no colon separation when splitting PV name to (device,parameter) tuple.
 
 #from time import perf_counter as timer
 
 from caproto.threading.client import Context
-Ctx = Context()
+_Ctx = Context()
 
-PVCache = {}# cache of PVs
-Subscriptions = []
+_PVCache = {}# cache of PVs
+# the key is EPICS PV name, the fields are as follows:
+_PVC_PV = 0# EPICS PV object
+_PVC_CB = 1# callback
+_PVC_Props = 2# PV properties
+_PVC_DevPar = 3# (deviceName, ParameterName)
 
-PVC_PV, PVC_CB, PVC_Props = 0, 1, 2
-dbg = False
-CA_data_type_STRING = 14
+_Subscriptions = []# list of EPICS PV subscriptions
 
-def printd(msg):
-    if dbg:
+_CA_data_type_STRING = 14
+
+_dbg = False
+def _printd(msg):
+    if _dbg:
         print(f'CPAccess:{msg}')
 
 def init():
     return
 
-def _get_pv(pvName):
-    r = PVCache.get(pvName)
-    if r is not None:
-        pv,*_ = r
+def _get_pv(devPar:tuple):
+    pvName = ''.join(devPar)
+    r = _PVCache.get(pvName)
+    if r is None:
+        _printd(f'register pv {pvName} {devPar}')
+        pv,*_ = _Ctx.get_pvs(''.join(pvName), timeout=2)
+        _PVCache[pvName] = [pv, None, None, devPar]
+        _fill_PVCacheProps(pv)
     else:
-        #printd( f'register pv {pvName}')
-        pv,*_ = Ctx.get_pvs(pvName, timeout=2)
-        PVCache[pvName] = [pv, None, None]
-        _fill_PVCacheProps(pvName)
+        pv,*_ = r
     return pv
 
-def _fill_PVCacheProps(pvName):
-    pv = PVCache[pvName][PVC_PV]
-    if pv is None:
-        return None
+def _fill_PVCacheProps(pv):
+    pvName = pv.name
     pvData = pv.read(data_type='time')
-    #printd(f'pvData:{pvData}')
     val = pvData.data
-    #printd(f'val:{val}')
     if len(val) == 1:
         try:
             # treat it as numpy
@@ -59,10 +66,10 @@ def _fill_PVCacheProps(pvName):
         if bit & featureCode:
             features += letter
     pvControl = pv.read(data_type='control')
-    #printd(f'pvcontrol {pvName}: {pvControl}')
+    #_printd(f'pvcontrol {pvName}: {pvControl}')
     datatype = pvControl.data_type
-    #printd(f'data_type:{datatype}')
-    if datatype == CA_data_type_STRING:# convert text bytearray to str
+    #_printd(f'data_type:{datatype}')
+    if datatype == _CA_data_type_STRING:# convert text bytearray to str
         val = val.decode()
     props = {'value':val}
     props['timestamp'] = pvData.metadata.timestamp
@@ -84,7 +91,7 @@ def _fill_PVCacheProps(pvName):
 
     try:
         props['alarm'] = pvControl.metadata.severity 
-        #printd(f'status {pvControl.metadata.severity}')
+        #_printd(f'status {pvControl.metadata.severity}')
         if props['alarm'] == 17:# UDF
             props['alarm'] = None
     except: pass
@@ -97,111 +104,88 @@ def _fill_PVCacheProps(pvName):
         #props['legalValues'] = None
         if 'legalValues' in props:
             del props['legalValues']
-    #printd(f'_props {props}')
-    PVCache[pvName][PVC_Props] = props
+    #_printd(f'_props {props}')
+    _PVCache[pvName][_PVC_Props] = props
 
-def info(devParName):
+def info(devPar:tuple):
     """Abridged PV info"""
-    pvName = ':'.join(devParName)
-    pv = _get_pv(pvName)
-    return {pvName:PVCache[pvName][PVC_Props]}
+    pvName = ''.join(devPar)
+    pv = _get_pv(devPar)
+    return {devPar:_PVCache[pvName][_PVC_Props]}
 
-def get(devParName, *args, **kwargs):
-    pvName = ':'.join(devParName)
-    pv = _get_pv(pvName)
+def get(devPar:tuple, *args, **kwargs):
+    '''Returns devPar-keyed map of PV properties: {'value','timestamp'...}'''
+    pvName = ''.join(devPar)
+    pv = _get_pv(devPar)
     pvData = pv.read(data_type='time')
     rDict = _unpack_ReadNotifyResponse(pvName, pvData)
     return rDict
 
-def set(devParValue):
+def set(devParValue:tuple):
+    '''Sets the PV value. The devParValue is (deviceName, ParameterName, value)
+    '''
     dev, par, value = devParValue
     #print(f'epicsAccess.set({dev,par,value})')
-    pvName = ':'.join((dev,par))
-    pv = _get_pv(pvName)
+    pvName = ''.join((dev,par))
+    pv = _get_pv((dev,par))
     try: # if PV has legalValues then the value should be index of legalValues
-        value = PVCache[pvName][PVC_Props]['legalValues'].index(value)
-        #lv = PVCache[pvName][PVC_Props]['legalValues']
-        #print(f'lv:{lv}')
+        value = _PVCache[pvName][_PVC_Props]['legalValues'].index(value)
     except Exception as e:
         #print(f'in epicsAccess.set. Value not in legalValues: {e}')
         pass
     pv.write(value)
     return 1
 
-def _unpack_ReadNotifyResponse(pvName, pvData):
-    #printd('>uRNR')
+def _unpack_ReadNotifyResponse(pvName:str, pvData):
     val = pvData.data
     if len(val) == 1:
         try:    #it as numpy
             val = pvData.data[0].item()
         except: # it is not numpy
             val = pvData.data[0]
-    #printd(f'pvData:{pvData}')
-    #printd(f'val:{val}, {pvData.data_type}')
-    if pvData.data_type == CA_data_type_STRING:
+    #_printd(f'pvData:{pvData}')
+    #_printd(f'val:{val}, {pvData.data_type}')
+    if pvData.data_type == _CA_data_type_STRING:
         val = val.decode()
-    #rDict = {'pvname':pvName, 'value':val}
-    
-    #rDict['timestamp'] = pvData.metadata.timestamp
-    ##printd(f'uRNR1:{rDict}')
 
-    legalValues = PVCache[pvName][PVC_Props].get('legalValues')
-    #printd(f'uRNR2:{legalValues}')
+    legalValues = _PVCache[pvName][_PVC_Props].get('legalValues')
     if legalValues is not None:
         #rDict['value'] = legalValues[int(val)]
         val = legalValues[int(val)]
-    #printd('uRNR3')
     alarm = pvData.metadata.severity
-    #rDict['alarm'] = alarm
-    #printd(f'pvName:{pvName}')
-    key = tuple(pvName.rsplit(':',1))
-    #printd(f'key:{key}')
+    key = _PVCache[pvName][_PVC_DevPar]
     rDict = {key: {'value':val\
     , 'timestamp':pvData.metadata.timestamp, 'alarm': alarm}}
-    #printd(f'<uRNR:{rDict}')
     return rDict
 
 def _callback(subscription, pvData):
-    #print(f'>epicsAccess._callback: {pvData})')
     #tMark = [timer(), 0., 0.]
     pvName = subscription.pv.name
+    _printd(f'>epicsAccess._callback: {pvName}')#{pvData})')
     rDict = _unpack_ReadNotifyResponse(pvName, pvData)
     #tMark[1] = timer()
-    #printd(f'rDict for {pvName}:{rDict}')
-    ##printd(f'PVCache:{PVCache}')
-    cache = PVCache.get(pvName)
-    #printd(f'cache[{len(cache)}]:{cache}')
-    ##printd(f'PVC_CB:{PVC_CB}')
-    cb = cache[PVC_CB]
-    ##printd(f'c0:{cache[0]}')
-    ##printd(f'c1:{cache[1]}')
-    #printd(f'cb:{str(cb)}')
+    cache = _PVCache.get(pvName)
+    cb = cache[_PVC_CB]
     if cb:
-        #print(f'epicsAccess call {cb}({rDict})')
         cb(rDict)
     #tMark[2] = timer() - tMark[1]
     #tMark[1] -= tMark[0]
-    ##printd(f'caproto cb times {tMark}')# 20-30 uS
-    #printd('<callback')
+    ##_printd(f'caproto cb times {tMark}')# 20-30 uS
     
-def subscribe(callback, devParName):
-    pvName = ':'.join(devParName)
-    #print(f'>epicsAccess subs({pvName})')
-    if not isinstance(pvName, str):
-        msg = f'ERROR: Second argument of subscribe() should be a string, not {type(pvName)}'
-        raise SystemError(msg)
-    pv = _get_pv(pvName)
+def subscribe(callback:callable, devPar:tuple):
+    '''Subscribe callback method to changes of PVs, defined by devPar'''
+    pvName = ''.join(devPar)
+    pv = _get_pv(devPar)
     subscription = pv.subscribe(data_type='time')
-    PVCache[pvName][PVC_CB] = callback
-    #printd('>add_callback')
+    _PVCache[pvName][_PVC_CB] = callback
     subscription.add_callback(_callback)
-    Subscriptions.append(subscription)
-    #print('<subs')
+    _Subscriptions.append(subscription)
 
 def unsubscribe():
-    global Subscriptions
-    for subscription in Subscriptions:
+    '''Unsubscribe all subscriptions'''
+    global _Subscriptions
+    for subscription in _Subscriptions:
         #print(f'>epicsAccess clear subs: {subscription}')
         subscription.clear()
-    Subscriptions = []
+    _Subscriptions = []
     
